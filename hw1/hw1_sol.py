@@ -1,6 +1,6 @@
 # ### * BEGIN STUDENT CODE *
 
-# In[4]:
+# In[303]:
 
 import apachetime
 import time
@@ -15,7 +15,7 @@ def apache_ts_to_unixtime(ts):
     return int(unixtime)
 
 
-# In[5]:
+# In[304]:
 
 def process_logs(dataset_iter):
     """
@@ -85,38 +85,33 @@ def process_logs(dataset_iter):
     
     # Prepare session_length_plot.csv
     
-    #get the max session_length that is generated in sessions.csv
-    get_ipython().system(u'tail -n +2 sessions.csv | awk -F"," -v max=0 \'{if($2>max){max = $2}}END{print max}\' > temp2')
-    curr_max = 0
-    with open("temp2", "r") as max_check:
-        curr_max = int(next(max_check))
-    #generate range pairs in a list as a tuple key
-    ranged_pairs = [[(0,2), 0]]
-    start = 2
-    end = 4
-    while curr_max > start:
-        ranged_pairs.append([(start, end), 0])
-        start *= 2
-        end *= 2
+    #sort sessions.csv by session length
+    get_ipython().system(u'tail -n +2 sessions.csv | sort -t"," -k 2,2n > {"temp2"}')
+    get_ipython().system(u'echo {"ignore"} >> {"temp2"}')
+    with open("session_length_plot.csv", "w+") as session_length_plot:
+        session_length_plot.write("left,right,count\n")
+        with open("temp2", "r") as fin:
+            next(fin)
         
-    #go through each session and place in the appropriate bin
-    with open("sessions.csv", "r") as fin:
-        next(fin)
-        for line in fin:
-            tok = line.split(",")
-            session_length = int(tok[1])
-            
-            for i in ranged_pairs:
-                if session_length >= i[0][0] and session_length < i[0][1]:
-                    i[1] += 1
+            start = 0
+            end = 2
+            session_length_count = 1
+            session_length = 0
+            for line in fin:
+                if line == "ignore\n":
+                    session_length_plot.write(str(start) + "," + str(end) + "," + str(session_length_count) + "\n")
                     break
+                tok = line.split(",")
+                session_length = int(tok[1])
+                if session_length >= start and session_length < end:
+                    session_length_count += 1
+                else:
+                    session_length_plot.write(str(start) + "," + str(end) + "," + str(session_length_count) + "\n")
+                    while not (session_length >= start and session_length < end):
+                        start = end
+                        end *= 2
                     
-    #write bins in order, if they have a count of 0, skip those bins
-    with open("session_length_plot.csv", "w+") as fin:
-        fin.write("left,right,count\n")
-        for i in ranged_pairs:
-            if i[0][1] != 0:
-                fin.write(str(i[0][0]) + "," + str(i[0][1]) + "," + str(i[1]) + "\n")
+                    session_length_count = 1
     
     #remove temp files
     get_ipython().system(u'rm {"temp"}')
