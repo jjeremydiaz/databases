@@ -189,9 +189,6 @@ class TransactionHandler:
         """
         for l in self._acquired_locks:
             temp = self._lock_table.get(l)
-            #print temp
-            #print self._xid
-            #print self._acquired_locks
             temp[1].remove(self._xid) #removes self from transaction list
             #Check waitlist is not empty
             if not temp[2]:
@@ -222,9 +219,12 @@ class TransactionHandler:
                     #clean waitlist
                     for i in range(count):
                         temp[2].pop(0)
-
+            
+            #Check if value is in the waitlist and remove it in case it was aborted
+            if self._desired_lock and (self._xid, self._desired_lock[1]) in temp[2]: 
+                temp[2].remove((self._xid, self._desired_lock[1]))    
         self._acquired_locks = []
-        self._desired_locks = None
+        self._desired_lock = None
     
     def commit(self):
         """
