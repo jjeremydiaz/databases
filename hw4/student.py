@@ -1,4 +1,5 @@
 import logging
+import Queue
 
 from kvstore import DBMStore, InMemoryKVStore
 
@@ -49,7 +50,6 @@ class TransactionHandler:
         self._xid = xid
         self._store = store
         self._undo_log = []
-
     def perform_put(self, key, value):
         """
         Handles the PUT request. You should first implement the logic for
@@ -73,8 +73,47 @@ class TransactionHandler:
         is waiting to acquire in self._desired_lock.
         """
         # Part 1.1: your code here!
-        self._store.put(key, value)
-        return 'Success'
+        #If there is no lock add an exclusive lock to the lock table and add
+		#the new lock to the transaction's acquired_locks. Lock table has
+        #format (curr_type, [xid], waitlist)
+        if key not in self._lock_table:
+	    	#If the key did not exist previously add (key, None) to undo_log
+			#so the key can be removed if the transaction gets aborted
+            if self._store.get(key):
+                self._undo_log.append((key, None))
+            else:
+                self._undo_log.append((key, self._store[key]))
+            
+            self._lock_table[key] = ['X', [self._xid], []]
+            self._store.put(key, value)
+            self._acquired_locks.append(key)
+            return 'Success'
+        #Already have X lock to write
+        elif key in self._lock_table and self._lock_table.get(key)[0] == 'X' and self._xid in self._lock_table.get(key)[1]:
+            self._store.put(key, value)
+            return 'Success'
+		#There is a conflicting lock, must add lock request to queue and set
+		#the desired lock, the transaction will be paused until the desired
+		#lock is free
+        else:
+            #Handles upgrade case, which only occurs when queue is empty and curr lock
+			#type is shared and it is the sole owner
+            if not self._store.get(key): #lock exists but no value exists
+                self._undo_log.append((key, None))
+            else:
+                self._undo_log.append((key, self._store.get(key)))
+            
+            temp = self._lock_table[key]
+            if not temp[2] and temp[0] == 'S':
+                if len(temp[1]) == 1 and self._xid == temp[1][0]:
+                    temp[0] = 'X'
+                    self._store.put(key, value)
+                    return 'Success'			  
+
+			#Need to queue for an X lock
+            self._desired_lock = (key, 'X', value)
+            temp[2].append((self._xid, 'X'))
+            return None
 
     def perform_get(self, key):
         """
@@ -96,11 +135,46 @@ class TransactionHandler:
         """
         # Part 1.1: your code here!
         value = self._store.get(key)
+        #The value does not exist in the data store put a lock on the value
+		#and map it to none
         if value is None:
+            if key not in self._lock_table:
+                self._lock_table[key] = ['S', [self._xid], []]
+                self._acquired_locks.append(key)
+            #if key is in lock table it just have a lock but no value
+            elif key in self._lock_table and self._lock_table[key][0] == 'S' and self._xid not in self._lock_table[key][1]:
+                self._lock_table[key][1].append(self._xid)
+                self._acquired_locks.append(key)
             return 'No such key'
+		#The value exists
         else:
-            return value
-
+			#Check if there is a lock, if there is no lock, add a lock, if
+			#there is a shared lock, add a lock, if there is an exclusive
+			#lock, put the key in the queue and change desired lock to key
+            #print "test"
+			#Check if another transaction has a X lock on the key, if so add request to queue
+            temp = self._lock_table.get(key)
+            if temp and temp[0] == 'X' and self._xid not in temp[1]:
+                temp[2].append((self._xid, 'S'))
+                self._desired_lock = (key, 'S', None)
+                return None
+			#Check if current transaction has an X lock with the key, if so then return value
+            elif temp and temp[0] == 'X' and temp[1][0] == self._xid:
+                return value
+            elif temp and temp[0] == 'S' and self._xid not in temp[1]:
+                temp[1].append(self._xid)
+                return value
+            else:
+				#lock doesn't exist in current transaction, add a shared lock
+                #prevents multiple key creation from same transaction
+                if key not in self._acquired_locks: 
+                    self._lock_table[key] = ['S', [self._xid], []]
+                    self._acquired_locks.append(key)
+                    return value	
+                else: #shared locks exist for the same key
+                    self._lock_table[key][1].append(self._xid)
+                    return value
+			
     def release_and_grant_locks(self):
         """
         Releases all locks acquired by the transaction and grants them to the
@@ -114,9 +188,44 @@ class TransactionHandler:
         @param self: the transaction handler.
         """
         for l in self._acquired_locks:
-            pass # Part 1.2: your code here!
-        self._acquired_locks = []
+            temp = self._lock_table.get(l)
+            #print temp
+            #print self._xid
+            #print self._acquired_locks
+            temp[1].remove(self._xid) #removes self from transaction list
+            #Check waitlist is not empty
+            if not temp[2]:
+                if not temp[1]: #if nothing in queue and key is empty, delete key in table
+                    del self._lock_table[l]
+                continue            
 
+            #Check if upgrade is possible, check if current lock is 'S' and also
+            #check if only 1 xid has that lock and check if that xid has a request
+            #for an X lock for the same key and also check that queue is not empty   
+            if temp[0] == 'S' and len(temp[1]) == 1 and (temp[1][0], 'X') in temp[2]:
+                temp[2].remove((temp[1][0], 'X')) #remove from waitlist
+                temp[0] = 'X' #Change to a X lock
+            #Otherwise traverse waitlist, if pop is X, add if temp[1] is empty, if pop is s and curr lock
+            #is S, keep adding all S on the queue until waitlist hits empty or X
+            else:
+                #There are no transactions so it can add multiple consecutive S transactions or a single X
+                if temp[2][0][1] == 'X' and len(temp[1]) == 0:
+                    temp[1].append(temp[2].pop(0)[0])                      
+                    temp[0] = 'X'
+                else: #The next item in waitlist is S, add consecutive S
+                    count = 0 
+                    for xid, lock in temp[2]:
+                        if lock == 'X':
+                            break
+                        temp[1].append(xid)
+                        count += 1
+                    #clean waitlist
+                    for i in range(count):
+                        temp[2].pop(0)
+
+        self._acquired_locks = []
+        self._desired_locks = None
+    
     def commit(self):
         """
         Commits the transaction.
@@ -191,12 +300,20 @@ class TransactionHandler:
         successfully acquired the lock. If the lock has not been granted,
         returns None.
         """
-        pass # Part 1.3: your code here!
+        #Use desired_lock (key, lock, value (optional)) and check the lock table to see if the transaction
+        #has gained access to that lock. If yeah return the result of the put or get
+        #operation, otherwise return None as it has not been blocked yet.
+        desired_lock = self._desired_lock
+        wanted_key = desired_lock[0]
+        #If request is not in the queue a lock is available
+        if (self._xid, desired_lock[1]) not in self._lock_table.get(wanted_key)[2]:
+            if desired_lock[1] == 'S' and self._lock_table.get(wanted_key)[0] == 'X' or self._lock_table.get(wanted_key)[0] == 'S':
+                return self.perform_get(wanted_key)
 
-
-
-
-
+            elif desired_lock[1] == 'X' and self._lock_table.get(wanted_key)[0] == 'X':
+                return self.perform_put(wanted_key, desired_lock[2]) 
+        else:
+            return None
 
 
 """
@@ -238,4 +355,41 @@ class TransactionCoordinator:
         @return: If there are no cycles in the waits-for graph, returns None.
         Otherwise, returns the xid of a transaction in a cycle.
         """
-        pass # Part 2.1: your code here!
+        #will return false if there is no cycle otherwise return first deadlocked
+        #xid uses variation of http://codereview.stackexchange.com/questions/86021/check-if-a-directed-graph-contains-a-cycle
+        def xid_cycle(graph):
+            path = set()
+            
+            def visit(vertex):
+                path.add(vertex)
+                for neighbour in graph.get(vertex, ()):
+                    if neighbour in path or visit(neighbour):
+                        return vertex
+                path.remove(vertex)
+                return False  
+            for v in graph:
+                test = visit(v)
+                if test:
+                    return test
+            return False
+
+        #Form graph where first value in the waitlist has edges to current values
+        #that it is waiting for. Do that for each key in the dictionary
+        #print self._lock_table
+        graph = {}
+        for key, value in self._lock_table.iteritems():
+            if not value[2]: #if nothing in queue, skip key
+                continue
+            graph[value[2][0][0]] = value[1]
+        
+        #If graph is empty, return None
+        if not graph:
+            return None
+        #otherwise do a dfs and check to see if a cycle exists. Return an xid involved in a cycle
+        #print graph 
+        else:
+            result = xid_cycle(graph)
+            if result == False: #There are no cycles
+                return None
+            else:
+               return result
